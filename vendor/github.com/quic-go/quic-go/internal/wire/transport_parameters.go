@@ -2,14 +2,13 @@ package wire
 
 import (
 	"bytes"
+	"crypto/rand"
 	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
-	"math/rand"
-	"net"
+	"net/netip"
 	"sort"
-	"sync"
 	"time"
 
 	"github.com/quic-go/quic-go/internal/protocol"
@@ -25,15 +24,6 @@ import (
 var AdditionalTransportParametersClient map[uint64][]byte
 
 const transportParameterMarshalingVersion = 1
-
-var (
-	randomMutex sync.Mutex
-	random      rand.Rand
-)
-
-func init() {
-	random = *rand.New(rand.NewSource(time.Now().UnixNano()))
-}
 
 type transportParameterID uint64
 
@@ -61,10 +51,7 @@ const (
 
 // PreferredAddress is the value encoding in the preferred_address transport parameter
 type PreferredAddress struct {
-	IPv4                net.IP
-	IPv4Port            uint16
-	IPv6                net.IP
-	IPv6Port            uint16
+	IPv4, IPv6          netip.AddrPort
 	ConnectionID        protocol.ConnectionID
 	StatelessResetToken protocol.StatelessResetToken
 }
@@ -118,6 +105,7 @@ func (p *TransportParameters) unmarshal(r *bytes.Reader, sentBy protocol.Perspec
 	var (
 		readOriginalDestinationConnectionID bool
 		readInitialSourceConnectionID       bool
+		readActiveConnectionIDLimit         bool
 	)
 
 	p.AckDelayExponent = protocol.DefaultAckDelayExponent
@@ -139,6 +127,9 @@ func (p *TransportParameters) unmarshal(r *bytes.Reader, sentBy protocol.Perspec
 		}
 		parameterIDs = append(parameterIDs, paramID)
 		switch paramID {
+		case activeConnectionIDLimitParameterID:
+			readActiveConnectionIDLimit = true
+			fallthrough
 		case maxIdleTimeoutParameterID,
 			maxUDPPayloadSizeParameterID,
 			initialMaxDataParameterID,
@@ -148,7 +139,6 @@ func (p *TransportParameters) unmarshal(r *bytes.Reader, sentBy protocol.Perspec
 			initialMaxStreamsBidiParameterID,
 			initialMaxStreamsUniParameterID,
 			maxAckDelayParameterID,
-			activeConnectionIDLimitParameterID,
 			maxDatagramFrameSizeParameterID,
 			ackDelayExponentParameterID:
 			if err := p.readNumericTransportParameter(r, paramID, int(paramLen)); err != nil {
@@ -196,6 +186,9 @@ func (p *TransportParameters) unmarshal(r *bytes.Reader, sentBy protocol.Perspec
 		}
 	}
 
+	if !readActiveConnectionIDLimit {
+		p.ActiveConnectionIDLimit = protocol.DefaultActiveConnectionIDLimit
+	}
 	if !fromSessionTicket {
 		if sentBy == protocol.PerspectiveServer && !readOriginalDestinationConnectionID {
 			return errors.New("missing original_destination_connection_id")
@@ -222,26 +215,24 @@ func (p *TransportParameters) unmarshal(r *bytes.Reader, sentBy protocol.Perspec
 func (p *TransportParameters) readPreferredAddress(r *bytes.Reader, expectedLen int) error {
 	remainingLen := r.Len()
 	pa := &PreferredAddress{}
-	ipv4 := make([]byte, 4)
-	if _, err := io.ReadFull(r, ipv4); err != nil {
+	var ipv4 [4]byte
+	if _, err := io.ReadFull(r, ipv4[:]); err != nil {
 		return err
 	}
-	pa.IPv4 = net.IP(ipv4)
 	port, err := utils.BigEndian.ReadUint16(r)
 	if err != nil {
 		return err
 	}
-	pa.IPv4Port = port
-	ipv6 := make([]byte, 16)
-	if _, err := io.ReadFull(r, ipv6); err != nil {
+	pa.IPv4 = netip.AddrPortFrom(netip.AddrFrom4(ipv4), port)
+	var ipv6 [16]byte
+	if _, err := io.ReadFull(r, ipv6[:]); err != nil {
 		return err
 	}
-	pa.IPv6 = net.IP(ipv6)
 	port, err = utils.BigEndian.ReadUint16(r)
 	if err != nil {
 		return err
 	}
-	pa.IPv6Port = port
+	pa.IPv6 = netip.AddrPortFrom(netip.AddrFrom16(ipv6), port)
 	connIDLen, err := r.ReadByte()
 	if err != nil {
 		return err
@@ -298,7 +289,7 @@ func (p *TransportParameters) readNumericTransportParameter(
 			return fmt.Errorf("initial_max_streams_uni too large: %d (maximum %d)", p.MaxUniStreamNum, protocol.MaxStreamCount)
 		}
 	case maxIdleTimeoutParameterID:
-		p.MaxIdleTimeout = utils.Max(protocol.MinRemoteIdleTimeout, time.Duration(val)*time.Millisecond)
+		p.MaxIdleTimeout = max(protocol.MinRemoteIdleTimeout, time.Duration(val)*time.Millisecond)
 	case maxUDPPayloadSizeParameterID:
 		if val < 1200 {
 			return fmt.Errorf("invalid value for max_packet_size: %d (minimum 1200)", val)
@@ -335,13 +326,12 @@ func (p *TransportParameters) Marshal(pers protocol.Perspective) []byte {
 	b := make([]byte, 0, 256)
 
 	// add a greased value
-	b = quicvarint.Append(b, uint64(27+31*rand.Intn(100)))
-	randomMutex.Lock()
-	length := random.Intn(16)
+	random := make([]byte, 18)
+	rand.Read(random)
+	b = quicvarint.Append(b, 27+31*uint64(random[0]))
+	length := random[1] % 16
 	b = quicvarint.Append(b, uint64(length))
-	b = b[:len(b)+length]
-	random.Read(b[len(b)-length:])
-	randomMutex.Unlock()
+	b = append(b, random[2:2+length]...)
 
 	// initial_max_stream_data_bidi_local
 	b = p.marshalVarintParam(b, initialMaxStreamDataBidiLocalParameterID, uint64(p.InitialMaxStreamDataBidiLocal))
@@ -389,20 +379,21 @@ func (p *TransportParameters) Marshal(pers protocol.Perspective) []byte {
 		if p.PreferredAddress != nil {
 			b = quicvarint.Append(b, uint64(preferredAddressParameterID))
 			b = quicvarint.Append(b, 4+2+16+2+1+uint64(p.PreferredAddress.ConnectionID.Len())+16)
-			ipv4 := p.PreferredAddress.IPv4
-			b = append(b, ipv4[len(ipv4)-4:]...)
-			b = append(b, []byte{0, 0}...)
-			binary.BigEndian.PutUint16(b[len(b)-2:], p.PreferredAddress.IPv4Port)
-			b = append(b, p.PreferredAddress.IPv6...)
-			b = append(b, []byte{0, 0}...)
-			binary.BigEndian.PutUint16(b[len(b)-2:], p.PreferredAddress.IPv6Port)
+			ip4 := p.PreferredAddress.IPv4.Addr().As4()
+			b = append(b, ip4[:]...)
+			b = binary.BigEndian.AppendUint16(b, p.PreferredAddress.IPv4.Port())
+			ip6 := p.PreferredAddress.IPv6.Addr().As16()
+			b = append(b, ip6[:]...)
+			b = binary.BigEndian.AppendUint16(b, p.PreferredAddress.IPv6.Port())
 			b = append(b, uint8(p.PreferredAddress.ConnectionID.Len()))
 			b = append(b, p.PreferredAddress.ConnectionID.Bytes()...)
 			b = append(b, p.PreferredAddress.StatelessResetToken[:]...)
 		}
 	}
 	// active_connection_id_limit
-	b = p.marshalVarintParam(b, activeConnectionIDLimitParameterID, p.ActiveConnectionIDLimit)
+	if p.ActiveConnectionIDLimit != protocol.DefaultActiveConnectionIDLimit {
+		b = p.marshalVarintParam(b, activeConnectionIDLimitParameterID, p.ActiveConnectionIDLimit)
+	}
 	// initial_source_connection_id
 	b = quicvarint.Append(b, uint64(initialSourceConnectionIDParameterID))
 	b = quicvarint.Append(b, uint64(p.InitialSourceConnectionID.Len()))
@@ -457,6 +448,10 @@ func (p *TransportParameters) MarshalForSessionTicket(b []byte) []byte {
 	b = p.marshalVarintParam(b, initialMaxStreamsBidiParameterID, uint64(p.MaxBidiStreamNum))
 	// initial_max_uni_streams
 	b = p.marshalVarintParam(b, initialMaxStreamsUniParameterID, uint64(p.MaxUniStreamNum))
+	// max_datagram_frame_size
+	if p.MaxDatagramFrameSize != protocol.InvalidByteCount {
+		b = p.marshalVarintParam(b, maxDatagramFrameSizeParameterID, uint64(p.MaxDatagramFrameSize))
+	}
 	// active_connection_id_limit
 	return p.marshalVarintParam(b, activeConnectionIDLimitParameterID, p.ActiveConnectionIDLimit)
 }
@@ -475,6 +470,9 @@ func (p *TransportParameters) UnmarshalFromSessionTicket(r *bytes.Reader) error 
 
 // ValidFor0RTT checks if the transport parameters match those saved in the session ticket.
 func (p *TransportParameters) ValidFor0RTT(saved *TransportParameters) bool {
+	if saved.MaxDatagramFrameSize != protocol.InvalidByteCount && (p.MaxDatagramFrameSize == protocol.InvalidByteCount || p.MaxDatagramFrameSize < saved.MaxDatagramFrameSize) {
+		return false
+	}
 	return p.InitialMaxStreamDataBidiLocal >= saved.InitialMaxStreamDataBidiLocal &&
 		p.InitialMaxStreamDataBidiRemote >= saved.InitialMaxStreamDataBidiRemote &&
 		p.InitialMaxStreamDataUni >= saved.InitialMaxStreamDataUni &&
@@ -482,6 +480,21 @@ func (p *TransportParameters) ValidFor0RTT(saved *TransportParameters) bool {
 		p.MaxBidiStreamNum >= saved.MaxBidiStreamNum &&
 		p.MaxUniStreamNum >= saved.MaxUniStreamNum &&
 		p.ActiveConnectionIDLimit == saved.ActiveConnectionIDLimit
+}
+
+// ValidForUpdate checks that the new transport parameters don't reduce limits after resuming a 0-RTT connection.
+// It is only used on the client side.
+func (p *TransportParameters) ValidForUpdate(saved *TransportParameters) bool {
+	if saved.MaxDatagramFrameSize != protocol.InvalidByteCount && (p.MaxDatagramFrameSize == protocol.InvalidByteCount || p.MaxDatagramFrameSize < saved.MaxDatagramFrameSize) {
+		return false
+	}
+	return p.ActiveConnectionIDLimit >= saved.ActiveConnectionIDLimit &&
+		p.InitialMaxData >= saved.InitialMaxData &&
+		p.InitialMaxStreamDataBidiLocal >= saved.InitialMaxStreamDataBidiLocal &&
+		p.InitialMaxStreamDataBidiRemote >= saved.InitialMaxStreamDataBidiRemote &&
+		p.InitialMaxStreamDataUni >= saved.InitialMaxStreamDataUni &&
+		p.MaxBidiStreamNum >= saved.MaxBidiStreamNum &&
+		p.MaxUniStreamNum >= saved.MaxUniStreamNum
 }
 
 // String returns a string representation, intended for logging.
