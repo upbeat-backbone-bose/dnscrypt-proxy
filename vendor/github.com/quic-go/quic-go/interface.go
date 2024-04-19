@@ -2,6 +2,7 @@ package quic
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"io"
 	"net"
@@ -15,14 +16,17 @@ import (
 // The StreamID is the ID of a QUIC stream.
 type StreamID = protocol.StreamID
 
+// A Version is a QUIC version number.
+type Version = protocol.Version
+
 // A VersionNumber is a QUIC version number.
-type VersionNumber = protocol.VersionNumber
+// Deprecated: VersionNumber was renamed to Version.
+type VersionNumber = Version
 
 const (
-	// VersionDraft29 is IETF QUIC draft-29
-	VersionDraft29 = protocol.VersionDraft29
 	// Version1 is RFC 9000
 	Version1 = protocol.Version1
+	// Version2 is RFC 9369
 	Version2 = protocol.Version2
 )
 
@@ -122,6 +126,8 @@ type SendStream interface {
 	// The Context is canceled as soon as the write-side of the stream is closed.
 	// This happens when Close() or CancelWrite() is called, or when the peer
 	// cancels the read-side of their stream.
+	// The cancellation cause is set to the error that caused the stream to
+	// close, or `context.Canceled` in case the stream is closed without error.
 	Context() context.Context
 	// SetWriteDeadline sets the deadline for future Write calls
 	// and any currently-blocked Write call.
@@ -157,6 +163,9 @@ type Connection interface {
 	OpenStream() (Stream, error)
 	// OpenStreamSync opens a new bidirectional QUIC stream.
 	// It blocks until a new stream can be opened.
+	// There is no signaling to the peer about new streams:
+	// The peer can only accept the stream after data has been sent on the stream,
+	// or the stream has been reset or closed.
 	// If the error is non-nil, it satisfies the net.Error interface.
 	// If the connection was closed due to a timeout, Timeout() will be true.
 	OpenStreamSync(context.Context) (Stream, error)
@@ -178,15 +187,21 @@ type Connection interface {
 	// The error string will be sent to the peer.
 	CloseWithError(ApplicationErrorCode, string) error
 	// Context returns a context that is cancelled when the connection is closed.
+	// The cancellation cause is set to the error that caused the connection to
+	// close, or `context.Canceled` in case the listener is closed first.
 	Context() context.Context
 	// ConnectionState returns basic details about the QUIC connection.
 	// Warning: This API should not be considered stable and might change soon.
 	ConnectionState() ConnectionState
 
-	// SendMessage sends a message as a datagram, as specified in RFC 9221.
-	SendMessage([]byte) error
-	// ReceiveMessage gets a message received in a datagram, as specified in RFC 9221.
-	ReceiveMessage() ([]byte, error)
+	// SendDatagram sends a message using a QUIC datagram, as specified in RFC 9221.
+	// There is no delivery guarantee for DATAGRAM frames, they are not retransmitted if lost.
+	// The payload of the datagram needs to fit into a single QUIC packet.
+	// In addition, a datagram may be dropped before being sent out if the available packet size suddenly decreases.
+	// If the payload is too large to be sent at the current time, a DatagramTooLargeError is returned.
+	SendDatagram(payload []byte) error
+	// ReceiveDatagram gets a message received in a datagram, as specified in RFC 9221.
+	ReceiveDatagram(context.Context) ([]byte, error)
 }
 
 // An EarlyConnection is a connection that is handshaking.
@@ -198,7 +213,7 @@ type EarlyConnection interface {
 
 	// HandshakeComplete blocks until the handshake completes (or fails).
 	// For the client, data sent before completion of the handshake is encrypted with 0-RTT keys.
-	// For the serfer, data sent before completion of the handshake is encrypted with 1-RTT keys,
+	// For the server, data sent before completion of the handshake is encrypted with 1-RTT keys,
 	// however the client's identity is only verified once the handshake completes.
 	HandshakeComplete() <-chan struct{}
 
@@ -207,6 +222,9 @@ type EarlyConnection interface {
 
 // StatelessResetKey is a key used to derive stateless reset tokens.
 type StatelessResetKey [32]byte
+
+// TokenGeneratorKey is a key used to encrypt session resumption tokens.
+type TokenGeneratorKey = handshake.TokenProtectorKey
 
 // A ConnectionID is a QUIC Connection ID, as defined in RFC 9000.
 // It is not able to handle QUIC Connection IDs longer than 20 bytes,
@@ -239,23 +257,15 @@ type ConnectionIDGenerator interface {
 
 // Config contains all configuration data needed for a QUIC server or client.
 type Config struct {
+	// GetConfigForClient is called for incoming connections.
+	// If the error is not nil, the connection attempt is refused.
+	GetConfigForClient func(info *ClientHelloInfo) (*Config, error)
 	// The QUIC versions that can be negotiated.
 	// If not set, it uses all versions available.
-	Versions []VersionNumber
-	// The length of the connection ID in bytes.
-	// It can be 0, or any value between 4 and 18.
-	// If not set, the interpretation depends on where the Config is used:
-	// If used for dialing an address, a 0 byte connection ID will be used.
-	// If used for a server, or dialing on a packet conn, a 4 byte connection ID will be used.
-	// When dialing on a packet conn, the ConnectionIDLength value must be the same for every Dial call.
-	ConnectionIDLength int
-	// An optional ConnectionIDGenerator to be used for ConnectionIDs generated during the lifecycle of a QUIC connection.
-	// The goal is to give some control on how connection IDs, which can be useful in some scenarios, in particular for servers.
-	// By default, if not provided, random connection IDs with the length given by ConnectionIDLength is used.
-	// Otherwise, if one is provided, then ConnectionIDLength is ignored.
-	ConnectionIDGenerator ConnectionIDGenerator
+	Versions []Version
 	// HandshakeIdleTimeout is the idle timeout before completion of the handshake.
-	// Specifically, if we don't receive any packet from the peer within this time, the connection attempt is aborted.
+	// If we don't receive any packet from the peer within this time, the connection attempt is aborted.
+	// Additionally, if the handshake doesn't complete in twice this time, the connection attempt is also aborted.
 	// If this value is zero, the timeout is set to 5 seconds.
 	HandshakeIdleTimeout time.Duration
 	// MaxIdleTimeout is the maximum duration that may pass without any incoming network activity.
@@ -264,18 +274,6 @@ type Config struct {
 	// If the timeout is exceeded, the connection is closed.
 	// If this value is zero, the timeout is set to 30 seconds.
 	MaxIdleTimeout time.Duration
-	// RequireAddressValidation determines if a QUIC Retry packet is sent.
-	// This allows the server to verify the client's address, at the cost of increasing the handshake latency by 1 RTT.
-	// See https://datatracker.ietf.org/doc/html/rfc9000#section-8 for details.
-	// If not set, every client is forced to prove its remote address.
-	RequireAddressValidation func(net.Addr) bool
-	// MaxRetryTokenAge is the maximum age of a Retry token.
-	// If not set, it defaults to 5 seconds. Only valid for a server.
-	MaxRetryTokenAge time.Duration
-	// MaxTokenAge is the maximum age of the token presented during the handshake,
-	// for tokens that were issued on a previous connection.
-	// If not set, it defaults to 24 hours. Only valid for a server.
-	MaxTokenAge time.Duration
 	// The TokenStore stores tokens received from the server.
 	// Tokens are used to skip address validation on future connection attempts.
 	// The key used to store tokens is the ServerName from the tls.Config, if set
@@ -285,17 +283,21 @@ type Config struct {
 	// If the application is consuming data quickly enough, the flow control auto-tuning algorithm
 	// will increase the window up to MaxStreamReceiveWindow.
 	// If this value is zero, it will default to 512 KB.
+	// Values larger than the maximum varint (quicvarint.Max) will be clipped to that value.
 	InitialStreamReceiveWindow uint64
 	// MaxStreamReceiveWindow is the maximum stream-level flow control window for receiving data.
 	// If this value is zero, it will default to 6 MB.
+	// Values larger than the maximum varint (quicvarint.Max) will be clipped to that value.
 	MaxStreamReceiveWindow uint64
 	// InitialConnectionReceiveWindow is the initial size of the stream-level flow control window for receiving data.
 	// If the application is consuming data quickly enough, the flow control auto-tuning algorithm
 	// will increase the window up to MaxConnectionReceiveWindow.
 	// If this value is zero, it will default to 512 KB.
+	// Values larger than the maximum varint (quicvarint.Max) will be clipped to that value.
 	InitialConnectionReceiveWindow uint64
 	// MaxConnectionReceiveWindow is the connection-level flow control window for receiving data.
 	// If this value is zero, it will default to 15 MB.
+	// Values larger than the maximum varint (quicvarint.Max) will be clipped to that value.
 	MaxConnectionReceiveWindow uint64
 	// AllowConnectionWindowIncrease is called every time the connection flow controller attempts
 	// to increase the connection flow control window.
@@ -305,64 +307,56 @@ type Config struct {
 	// in this callback.
 	AllowConnectionWindowIncrease func(conn Connection, delta uint64) bool
 	// MaxIncomingStreams is the maximum number of concurrent bidirectional streams that a peer is allowed to open.
-	// Values above 2^60 are invalid.
 	// If not set, it will default to 100.
 	// If set to a negative value, it doesn't allow any bidirectional streams.
+	// Values larger than 2^60 will be clipped to that value.
 	MaxIncomingStreams int64
 	// MaxIncomingUniStreams is the maximum number of concurrent unidirectional streams that a peer is allowed to open.
-	// Values above 2^60 are invalid.
 	// If not set, it will default to 100.
 	// If set to a negative value, it doesn't allow any unidirectional streams.
+	// Values larger than 2^60 will be clipped to that value.
 	MaxIncomingUniStreams int64
-	// The StatelessResetKey is used to generate stateless reset tokens.
-	// If no key is configured, sending of stateless resets is disabled.
-	StatelessResetKey *StatelessResetKey
 	// KeepAlivePeriod defines whether this peer will periodically send a packet to keep the connection alive.
 	// If set to 0, then no keep alive is sent. Otherwise, the keep alive is sent on that period (or at most
 	// every half of MaxIdleTimeout, whichever is smaller).
 	KeepAlivePeriod time.Duration
 	// DisablePathMTUDiscovery disables Path MTU Discovery (RFC 8899).
-	// Packets will then be at most 1252 (IPv4) / 1232 (IPv6) bytes in size.
-	// Note that if Path MTU discovery is causing issues on your system, please open a new issue
+	// This allows the sending of QUIC packets that fully utilize the available MTU of the path.
+	// Path MTU discovery is only available on systems that allow setting of the Don't Fragment (DF) bit.
+	// If unavailable or disabled, packets will be at most 1252 (IPv4) / 1232 (IPv6) bytes in size.
 	DisablePathMTUDiscovery bool
-	// DisableVersionNegotiationPackets disables the sending of Version Negotiation packets.
-	// This can be useful if version information is exchanged out-of-band.
-	// It has no effect for a client.
-	DisableVersionNegotiationPackets bool
 	// Allow0RTT allows the application to decide if a 0-RTT connection attempt should be accepted.
-	// When set, 0-RTT is enabled. When not set, 0-RTT is disabled.
 	// Only valid for the server.
-	// Warning: This API should not be considered stable and might change soon.
-	Allow0RTT func(net.Addr) bool
+	Allow0RTT bool
 	// Enable QUIC datagram support (RFC 9221).
 	EnableDatagrams bool
-	Tracer          logging.Tracer
+	Tracer          func(context.Context, logging.Perspective, ConnectionID) *logging.ConnectionTracer
+}
+
+// ClientHelloInfo contains information about an incoming connection attempt.
+type ClientHelloInfo struct {
+	// RemoteAddr is the remote address on the Initial packet.
+	// Unless AddrVerified is set, the address is not yet verified, and could be a spoofed IP address.
+	RemoteAddr net.Addr
+	// AddrVerified says if the remote address was verified using QUIC's Retry mechanism.
+	// Note that the Retry mechanism costs one network roundtrip,
+	// and is not performed unless Transport.MaxUnvalidatedHandshakes is surpassed.
+	AddrVerified bool
 }
 
 // ConnectionState records basic details about a QUIC connection
 type ConnectionState struct {
-	TLS               handshake.ConnectionState
+	// TLS contains information about the TLS connection state, incl. the tls.ConnectionState.
+	TLS tls.ConnectionState
+	// SupportsDatagrams says if support for QUIC datagrams (RFC 9221) was negotiated.
+	// This requires both nodes to support and enable the datagram extensions (via Config.EnableDatagrams).
+	// If datagram support was negotiated, datagrams can be sent and received using the
+	// SendDatagram and ReceiveDatagram methods on the Connection.
 	SupportsDatagrams bool
-	Version           VersionNumber
-}
-
-// A Listener for incoming QUIC connections
-type Listener interface {
-	// Close the server. All active connections will be closed.
-	Close() error
-	// Addr returns the local network addr that the server is listening on.
-	Addr() net.Addr
-	// Accept returns new connections. It should be called in a loop.
-	Accept(context.Context) (Connection, error)
-}
-
-// An EarlyListener listens for incoming QUIC connections,
-// and returns them before the handshake completes.
-type EarlyListener interface {
-	// Close the server. All active connections will be closed.
-	Close() error
-	// Addr returns the local network addr that the server is listening on.
-	Addr() net.Addr
-	// Accept returns new early connections. It should be called in a loop.
-	Accept(context.Context) (EarlyConnection, error)
+	// Used0RTT says if 0-RTT resumption was used.
+	Used0RTT bool
+	// Version is the QUIC version of the QUIC connection.
+	Version Version
+	// GSO says if generic segmentation offload is used
+	GSO bool
 }

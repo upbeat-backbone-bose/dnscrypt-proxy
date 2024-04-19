@@ -179,6 +179,10 @@ func (s *receiveStream) readImpl(p []byte) (bool /*stream completed */, int, err
 
 		if s.readPosInFrame >= len(s.currentFrame) && s.currentFrameIsLast {
 			s.finRead = true
+			s.currentFrame = nil
+			if s.currentFrameDone != nil {
+				s.currentFrameDone()
+			}
 			return true, bytesRead, io.EOF
 		}
 	}
@@ -286,10 +290,6 @@ func (s *receiveStream) handleResetStreamFrameImpl(frame *wire.ResetStreamFrame)
 	}
 	s.signalRead()
 	return newlyRcvdFinalOffset, nil
-}
-
-func (s *receiveStream) CloseRemote(offset protocol.ByteCount) {
-	s.handleStreamFrame(&wire.StreamFrame{Fin: true, Offset: offset})
 }
 
 func (s *receiveStream) SetReadDeadline(t time.Time) error {

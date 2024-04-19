@@ -13,8 +13,6 @@ import (
 )
 
 // ParseConnectionID parses the destination connection ID of a packet.
-// It uses the data slice for the connection ID.
-// That means that the connection ID must not be used after the packet buffer is released.
 func ParseConnectionID(data []byte, shortHeaderConnIDLen int) (protocol.ConnectionID, error) {
 	if len(data) == 0 {
 		return protocol.ConnectionID{}, io.EOF
@@ -76,6 +74,10 @@ func parseArbitraryLenConnectionIDs(r *bytes.Reader) (dest, src protocol.Arbitra
 	return destConnID, srcConnID, nil
 }
 
+func IsPotentialQUICPacket(firstByte byte) bool {
+	return firstByte&0x40 > 0
+}
+
 // IsLongHeaderPacket says if this is a Long Header packet
 func IsLongHeaderPacket(firstByte byte) bool {
 	return firstByte&0x80 > 0
@@ -83,11 +85,11 @@ func IsLongHeaderPacket(firstByte byte) bool {
 
 // ParseVersion parses the QUIC version.
 // It should only be called for Long Header packets (Short Header packets don't contain a version number).
-func ParseVersion(data []byte) (protocol.VersionNumber, error) {
+func ParseVersion(data []byte) (protocol.Version, error) {
 	if len(data) < 5 {
 		return 0, io.EOF
 	}
-	return protocol.VersionNumber(binary.BigEndian.Uint32(data[1:5])), nil
+	return protocol.Version(binary.BigEndian.Uint32(data[1:5])), nil
 }
 
 // IsVersionNegotiationPacket says if this is a version negotiation packet
@@ -107,10 +109,10 @@ func Is0RTTPacket(b []byte) bool {
 	if !IsLongHeaderPacket(b[0]) {
 		return false
 	}
-	version := protocol.VersionNumber(binary.BigEndian.Uint32(b[1:5]))
+	version := protocol.Version(binary.BigEndian.Uint32(b[1:5]))
 	//nolint:exhaustive // We only need to test QUIC versions that we support.
 	switch version {
-	case protocol.Version1, protocol.VersionDraft29:
+	case protocol.Version1:
 		return b[0]>>4&0b11 == 0b01
 	case protocol.Version2:
 		return b[0]>>4&0b11 == 0b10
@@ -126,7 +128,7 @@ type Header struct {
 	typeByte byte
 	Type     protocol.PacketType
 
-	Version          protocol.VersionNumber
+	Version          protocol.Version
 	SrcConnectionID  protocol.ConnectionID
 	DestConnectionID protocol.ConnectionID
 
@@ -182,7 +184,7 @@ func (h *Header) parseLongHeader(b *bytes.Reader) error {
 	if err != nil {
 		return err
 	}
-	h.Version = protocol.VersionNumber(v)
+	h.Version = protocol.Version(v)
 	if h.Version != 0 && h.typeByte&0x40 == 0 {
 		return errors.New("not a QUIC packet")
 	}
@@ -276,7 +278,7 @@ func (h *Header) ParsedLen() protocol.ByteCount {
 
 // ParseExtended parses the version dependent part of the header.
 // The Reader has to be set such that it points to the first byte of the header.
-func (h *Header) ParseExtended(b *bytes.Reader, ver protocol.VersionNumber) (*ExtendedHeader, error) {
+func (h *Header) ParseExtended(b *bytes.Reader, ver protocol.Version) (*ExtendedHeader, error) {
 	extHdr := h.toExtendedHeader()
 	reservedBitsValid, err := extHdr.parse(b, ver)
 	if err != nil {
